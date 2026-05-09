@@ -28,34 +28,42 @@ class Account
      *
      * @return array<int, array>
      */
-    public function findAllByUser(int $userId, ?string $search = null): array
+    public function findAllByUser(
+        int $userId,
+        ?string $search = null,
+        ?bool $favorite = null,
+        ?string $category = null,
+        bool $deletedOnly = false
+    ): array
     {
-        if ($search !== null && $search !== '') {
-            $like = '%' . $search . '%';
-            $stmt = $this->db->prepare(
-                'SELECT id, user_id, site_name, site_url, username,
-                        encrypted_password, notes, created_at, updated_at
-                 FROM   accounts
-                 WHERE  user_id = :user_id
-                   AND  (site_name LIKE :s1 OR site_url LIKE :s2 OR username LIKE :s3)
-                 ORDER  BY site_name ASC'
-            );
-            $stmt->execute([
-                ':user_id' => $userId,
-                ':s1'      => $like,
-                ':s2'      => $like,
-                ':s3'      => $like,
-            ]);
-        } else {
-            $stmt = $this->db->prepare(
-                'SELECT id, user_id, site_name, site_url, username,
-                        encrypted_password, notes, created_at, updated_at
-                 FROM   accounts
-                 WHERE  user_id = :user_id
-                 ORDER  BY site_name ASC'
-            );
-            $stmt->execute([':user_id' => $userId]);
+        $where = ['user_id = :user_id', $deletedOnly ? 'deleted_at IS NOT NULL' : 'deleted_at IS NULL'];
+        $params = [':user_id' => $userId];
+
+        if ($search !== null && trim($search) !== '') {
+            $where[] = '(site_name LIKE :search_site OR site_url LIKE :search_url OR username LIKE :search_username)';
+            $like = '%' . trim($search) . '%';
+            $params[':search_site'] = $like;
+            $params[':search_url'] = $like;
+            $params[':search_username'] = $like;
         }
+        if ($favorite !== null) {
+            $where[] = 'favorite = :favorite';
+            $params[':favorite'] = $favorite ? 1 : 0;
+        }
+        if ($category !== null && trim($category) !== '') {
+            $where[] = 'category = :category';
+            $params[':category'] = trim($category);
+        }
+
+        $stmt = $this->db->prepare(
+            'SELECT id, user_id, site_name, site_url, username,
+                    encrypted_password, favorite, category, deleted_at, last_used_at, password_updated_at,
+                    notes, created_at, updated_at
+             FROM   accounts
+             WHERE  ' . implode(' AND ', $where) . '
+             ORDER  BY site_name ASC'
+        );
+        $stmt->execute($params);
 
         return $stmt->fetchAll();
     }
@@ -68,9 +76,10 @@ class Account
     {
         $stmt = $this->db->prepare(
             'SELECT id, user_id, site_name, site_url, username,
-                    encrypted_password, notes, created_at, updated_at
+                    encrypted_password, favorite, category, deleted_at, last_used_at, password_updated_at,
+                    notes, created_at, updated_at
              FROM   accounts
-             WHERE  id = :id AND user_id = :user_id
+             WHERE  id = :id AND user_id = :user_id AND deleted_at IS NULL
              LIMIT  1'
         );
         $stmt->execute([':id' => $id, ':user_id' => $userId]);
@@ -87,13 +96,17 @@ class Account
         ?string $siteUrl,
         string $username,
         string $encryptedPassword,
-        ?string $notes
+        bool $favorite,
+        ?string $category,
+        ?string $notes,
+        ?string $lastUsedAt = null,
+        ?string $passwordUpdatedAt = null
     ): int {
         $stmt = $this->db->prepare(
             'INSERT INTO accounts
-                (user_id, site_name, site_url, username, encrypted_password, notes)
+                (user_id, site_name, site_url, username, encrypted_password, favorite, category, last_used_at, password_updated_at, notes)
              VALUES
-                (:user_id, :site_name, :site_url, :username, :encrypted_password, :notes)'
+                (:user_id, :site_name, :site_url, :username, :encrypted_password, :favorite, :category, :last_used_at, COALESCE(:password_updated_at, CURRENT_TIMESTAMP), :notes)'
         );
         $stmt->execute([
             ':user_id'            => $userId,
@@ -101,9 +114,28 @@ class Account
             ':site_url'           => $siteUrl,
             ':username'           => $username,
             ':encrypted_password' => $encryptedPassword,
+            ':favorite'           => $favorite ? 1 : 0,
+            ':category'           => $category,
+            ':last_used_at'       => $lastUsedAt,
+            ':password_updated_at' => $passwordUpdatedAt,
             ':notes'              => $notes,
         ]);
         return (int) $this->db->lastInsertId();
+    }
+
+    public function findAnyByIdAndUser(int $id, int $userId): ?array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT id, user_id, site_name, site_url, username,
+                    encrypted_password, favorite, category, deleted_at, last_used_at, password_updated_at,
+                    notes, created_at, updated_at
+             FROM   accounts
+             WHERE  id = :id AND user_id = :user_id
+             LIMIT  1'
+        );
+        $stmt->execute([':id' => $id, ':user_id' => $userId]);
+        $row = $stmt->fetch();
+        return $row ?: null;
     }
 
     /**
@@ -117,6 +149,8 @@ class Account
         ?string $siteUrl,
         string $username,
         string $encryptedPassword,
+        bool $favorite,
+        ?string $category,
         ?string $notes
     ): bool {
         $stmt = $this->db->prepare(
@@ -125,6 +159,9 @@ class Account
                     site_url           = :site_url,
                     username           = :username,
                     encrypted_password = :encrypted_password,
+                    favorite           = :favorite,
+                    category           = :category,
+                    password_updated_at = NOW(),
                     notes              = :notes
              WHERE  id = :id AND user_id = :user_id'
         );
@@ -133,6 +170,8 @@ class Account
             ':site_url'           => $siteUrl,
             ':username'           => $username,
             ':encrypted_password' => $encryptedPassword,
+            ':favorite'           => $favorite ? 1 : 0,
+            ':category'           => $category,
             ':notes'              => $notes,
             ':id'                 => $id,
             ':user_id'            => $userId,
@@ -141,15 +180,61 @@ class Account
     }
 
     /**
-     * Delete an account. Scoped to user_id for safety.
+     * Soft-delete an account. Scoped to user_id for safety.
      * Returns true if a row was actually deleted.
      */
     public function delete(int $id, int $userId): bool
     {
         $stmt = $this->db->prepare(
-            'DELETE FROM accounts WHERE id = :id AND user_id = :user_id'
+            'UPDATE accounts SET deleted_at = NOW() WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL'
         );
         $stmt->execute([':id' => $id, ':user_id' => $userId]);
         return $stmt->rowCount() > 0;
+    }
+
+    public function restore(int $id, int $userId): bool
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE accounts SET deleted_at = NULL WHERE id = :id AND user_id = :user_id AND deleted_at IS NOT NULL'
+        );
+        $stmt->execute([':id' => $id, ':user_id' => $userId]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public function permanentlyDelete(int $id, int $userId): bool
+    {
+        $stmt = $this->db->prepare(
+            'DELETE FROM accounts WHERE id = :id AND user_id = :user_id AND deleted_at IS NOT NULL'
+        );
+        $stmt->execute([':id' => $id, ':user_id' => $userId]);
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Update only the encrypted_password column (used when re-wrapping vault data).
+     */
+    public function updateEncryptedPassword(int $id, int $userId, string $newCipher): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE accounts
+             SET    encrypted_password = :cipher,
+                    password_updated_at = NOW()
+             WHERE  id = :id AND user_id = :user_id'
+        );
+        $stmt->execute([
+            ':cipher'  => $newCipher,
+            ':id'      => $id,
+            ':user_id' => $userId,
+        ]);
+    }
+
+    public function markUsed(int $id, int $userId): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE accounts
+             SET last_used_at = NOW()
+             WHERE id = :id AND user_id = :user_id'
+        );
+        $stmt->execute([':id' => $id, ':user_id' => $userId]);
     }
 }

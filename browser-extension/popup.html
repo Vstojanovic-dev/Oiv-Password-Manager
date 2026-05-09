@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Password Manager Autofill</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <div>
+          <h1>Password Manager</h1>
+          <p id="domain">Checking current tab...</p>
+        </div>
+        <button id="refresh" class="icon-button" title="Refresh" type="button">&#8635;</button>
+      </header>
+
+      <section id="notice" class="notice hidden"></section>
+
+      <section id="locked" class="panel hidden">
+        <h2>Vault locked</h2>
+        <p>Log in through the web app first, then return to this extension.</p>
+        <button id="open-app" class="primary" type="button">Open Password Manager</button>
+      </section>
+
+      <section id="content" class="hidden">
+        <div class="status-row">
+          <span id="auth-status" class="pill">Checking</span>
+          <span id="form-status" class="muted">Detecting form</span>
+        </div>
+
+        <div id="save-prompt" class="save-prompt hidden">
+          <div>
+            <h2 id="save-title">Save password?</h2>
+            <p id="save-description">A manually entered password is ready to save.</p>
+          </div>
+          <div class="button-row">
+            <button id="save-confirm" class="primary" type="button">Save</button>
+            <button id="save-dismiss" class="secondary" type="button">Dismiss</button>
+          </div>
+        </div>
+
+        <div id="empty" class="panel hidden">
+          <h2>No entries</h2>
+          <p>No saved credentials match this domain.</p>
+          <button id="open-vault-empty" class="secondary" type="button">Open Vault</button>
+        </div>
+
+        <div id="accounts" class="accounts"></div>
+      </section>
+
+      <footer>
+        <button id="open-vault" class="secondary" type="button">Open Vault</button>
+      </footer>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

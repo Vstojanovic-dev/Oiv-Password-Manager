@@ -1,0 +1,15 @@
+{
+  "name": "oiv/password-manager",
+  "description": "Password manager backend tests",
+  "type": "project",
+  "require-dev": {
+    "phpunit/phpunit": "^11.5"
+  },
+  "scripts": {
+    "test": "phpunit",
+    "audit:ci": "composer audit"
+  },
+  "config": {
+    "sort-packages": true
+  }
+}

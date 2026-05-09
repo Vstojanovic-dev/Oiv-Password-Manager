@@ -1,34 +1,96 @@
 services:
+  frontend:
+    image: node:22.16-alpine
+    working_dir: /app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      VITE_API_BASE: ""
+    volumes:
+      - ./data/www/frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - spletni-streznik
 
   spletni-streznik:
-    build: # Namesto uporabe obstoječe Docker slike, bomo sliko zgradili na podlagi spodnjih navodil, kjer bomo osnovni sliki php:apache dodali še razširitve za povezovanje s podatkovno bazo
+    build:
       context: .
       dockerfile_inline: |
-          FROM php:apache
-          RUN docker-php-ext-install pdo pdo_mysql && a2enmod rewrite
-          RUN printf '<Directory /var/www/html>\n    AllowOverride All\n    Require all granted\n</Directory>\n' \
-              > /etc/apache2/conf-enabled/override.conf
-    restart: unless-stopped # Omogoča, da se zabojnik ponovno zažene v primeru napake, razen če ga uporabnik ročno ustavi
+        FROM php:8.3-apache
+        RUN docker-php-ext-install pdo pdo_mysql && a2enmod rewrite
+        RUN printf 'display_errors=Off\nlog_errors=On\nexpose_php=Off\nupload_max_filesize=2M\npost_max_size=3M\nmemory_limit=128M\n' \
+            > /usr/local/etc/php/conf.d/security.ini
+        RUN printf '<Directory /var/www/html>\n    AllowOverride All\n    Require all granted\n</Directory>\n' \
+            > /etc/apache2/conf-enabled/override.conf
+    restart: unless-stopped
     ports:
-      - 127.0.0.1:8000:80 # Poveže notranja vrata 80 (Apache privzeta vrata) na zunanja vrata 8000, kar omogoča dostop do spletne strani preko brskalnika na http://localhost:8000. Predpona "127.0.0.1" spletni strežnik zaščiti, da se nanj ni možno povezati iz kakšne druge naprave na omrežju, na katerega je računalnik priklopljen
-    volumes:
-      - ./data/www:/var/www/html/ # Poveže lokalno mapo './data/www' z glavno mapo spletnega strežnika znotraj zabojnika. V to mapo namestimo datoteke spletne aplikacije.
-      
-  mysql:
-    hostname: podatkovna-baza # Ime zabojnika, lahko ga spremenite po želji. To ime uporabite za povezavo na podatkovno bazo kot ime strežnika oz. "hostname"
-    image: mysql:latest # Docker slika, ki se prenese iz https://hub.docker.com/_/mysql. Lahko uporabite različico, npr. mysql:8.0.41, ali pa 'mysql:latest' za najnovejšo različico
-    restart: unless-stopped # Omogoča, da se zabojnik ponovno zažene v primeru napake, razen če ga uporabnik ročno ustavi
+      - "127.0.0.1:8000:80"
     environment:
-     - MYSQL_ROOT_PASSWORD=superVarnoGeslo # Nastavi geslo za root uporabnika. Priporočljivo je, da je to geslo varno in edinstveno
+      APP_ENV: ${APP_ENV:-development}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET must be set in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      SESSION_TIMEOUT_MINUTES: ${SESSION_TIMEOUT_MINUTES:-15}
+      BACKUP_DIR: ${BACKUP_DIR:-/var/app/backups}
+      BACKUP_MAX_BYTES: ${BACKUP_MAX_BYTES:-2097152}
+      BACKUP_MAX_ACCOUNTS: ${BACKUP_MAX_ACCOUNTS:-1000}
+      JSON_REQUEST_MAX_BYTES: ${JSON_REQUEST_MAX_BYTES:-1048576}
+      DB_HOST: podatkovna-baza
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-password_manager}
+      DB_USER: ${DB_USER:?DB_USER must be set in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
     volumes:
-      - ./data/mysql:/var/lib/mysql # Poveže lokalno mapo './data/mysql' z MySQL podatkovno mapo znotraj zabojnika, da se ohranijo podatki med ponovnimi zagoni
-    #ports:
-    # - "127.0.0.1:3306:3306" # Poveže notranja vrata 3306 (privzeta MySQL) na zunanja 3306, kar omogoča dostop do MySQL izven zabojnika (vrata na levi strani dvopičja lahko poljubno spremenimo) - to in prejšnjo vrstico potrebujemo zgolj v primeru, da se želimo na podatkovno bazo povezati iz kakšnega zunanjega orodja, kot je npr. MySQL Workbench
+      - ./data/www:/var/www/html/
+      - backend_backups:/var/app/backups
+    command: sh -c "mkdir -p /var/app/backups && chown -R www-data:www-data /var/app/backups && apache2-foreground"
+    healthcheck:
+      test: ["CMD-SHELL", "php -r 'try { $$j = json_decode(file_get_contents(\"http://127.0.0.1/backend/api/health\"), true); exit((( $$j[\"success\"] ?? false) && (( $$j[\"data\"][\"database\"] ?? \"\") === \"ok\")) ? 0 : 1); } catch (Throwable $$e) { exit(1); }'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  phpunit:
+    image: composer:2
+    working_dir: /app
+    environment:
+      API_BASE: http://spletni-streznik/backend/api
+      BACKUP_DIR: /var/app/backups
+    volumes:
+      - ./:/app
+      - backend_backups:/var/app/backups:ro
+      - composer_vendor:/app/vendor
+      - composer_cache:/tmp/cache
+    command: sh -c "composer install && vendor/bin/phpunit"
+    depends_on:
+      spletni-streznik:
+        condition: service_healthy
+
+  mysql:
+    hostname: podatkovna-baza
+    image: mysql:8.4.9
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set in .env}
+      MYSQL_DATABASE: ${DB_NAME:-password_manager}
+      MYSQL_USER: ${DB_USER:?DB_USER must be set in .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
 
   phpmyadmin:
-    image: phpmyadmin/phpmyadmin:latest # Docker slika za phpMyAdmin. 'latest' bo prenesla najnovejšo različico
-    restart: unless-stopped # Omogoča, da se zabojnik ponovno zažene v primeru napake, razen če ga uporabnik ročno ustavi
+    image: phpmyadmin/phpmyadmin:5.2
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:8001:80" # Poveže notranja vrata 80 na zunanja 8001, kar omogoča dostop do phpMyAdmin preko brskalnika na http://localhost:8001 (vrata na levi strani dvopičja lahko poljubno spremenimo), prijavite pa se z uporabniškim imenom "root" ter geslom, ki je nastavljeno zraven MYSQL_ROOT_PASSWORD . Predpona "127.0.0.1" spletni strežnik zaščiti, da se nanj ni možno povezati iz kakšne druge naprave na omrežju, na katerega je računalnik priklopljen
+      - "127.0.0.1:8001:80"
     environment:
-      PMA_HOST: podatkovna-baza  # Ime MySQL zabojnika, na katerega se phpMyAdmin poveže. To je ime MySQL zabojnika ('mysql-pb'), ki ga uporablja Docker za omrežno povezovanje med zabojniki.
+      PMA_HOST: podatkovna-baza
+
+volumes:
+  frontend_node_modules:
+  composer_vendor:
+  composer_cache:
+  backend_backups:

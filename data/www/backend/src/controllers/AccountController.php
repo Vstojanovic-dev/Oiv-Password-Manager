@@ -1,217 +1,275 @@
 <?php
 
+require_once __DIR__ . '/../../src/Crypto.php';
+require_once __DIR__ . '/../../src/PasswordPolicy.php';
 require_once __DIR__ . '/../../src/models/Account.php';
+require_once __DIR__ . '/../../src/models/AccountPasswordHistory.php';
 require_once __DIR__ . '/../../src/middleware/Auth.php';
 require_once __DIR__ . '/../../utils/Response.php';
 
-/**
- * AccountController
- *
- * Handles all account CRUD endpoints. Every method calls Auth::requireAuth()
- * first, so all routes are protected — no session, no access.
- *
- * Password encryption strategy:
- *   Vault passwords must be retrievable, so they are AES-256-CBC encrypted
- *   (not hashed). The encryption key is derived from the master password hash
- *   stored in the session — this way the key never touches the database.
- *
- *   encrypt() / decrypt() are private helpers used by every endpoint.
- */
 class AccountController
 {
     private Account $accountModel;
+    private AccountPasswordHistory $passwordHistoryModel;
 
     public function __construct()
     {
         $this->accountModel = new Account();
+        $this->passwordHistoryModel = new AccountPasswordHistory();
     }
 
-    // -------------------------------------------------------------------------
-    // GET /accounts          → list all (optional ?search=)
-    // -------------------------------------------------------------------------
     public function index(): void
     {
         $userId = Auth::requireAuth();
         $search = $_GET['search'] ?? null;
-
-        $accounts = $this->accountModel->findAllByUser($userId, $search);
-
-        // Decrypt passwords before sending
+        $favorite = $this->optionalBoolean($_GET['favorite'] ?? null);
+        $category = isset($_GET['category']) ? trim((string) $_GET['category']) : null;
         $accounts = array_map(function (array $account): array {
-            $account['password'] = $this->decrypt($account['encrypted_password']);
-            unset($account['encrypted_password']);
-            return $account;
-        }, $accounts);
+            return $this->formatAccount($account);
+        }, $this->accountModel->findAllByUser($userId, $search, $favorite, $category));
 
         Response::success($accounts);
     }
 
-    // -------------------------------------------------------------------------
-    // GET /accounts/{id}     → single account
-    // -------------------------------------------------------------------------
+    public function trash(): void
+    {
+        $userId = Auth::requireAuth();
+        $accounts = array_map(function (array $account): array {
+            return $this->formatAccount($account);
+        }, $this->accountModel->findAllByUser($userId, null, null, null, true));
+
+        Response::success($accounts);
+    }
+
     public function show(int $id): void
     {
-        $userId  = Auth::requireAuth();
+        $userId = Auth::requireAuth();
         $account = $this->accountModel->findByIdAndUser($id, $userId);
 
         if ($account === null) {
             Response::error('Account not found.', 404);
         }
 
-        $account['password'] = $this->decrypt($account['encrypted_password']);
-        unset($account['encrypted_password']);
-
-        Response::success($account);
+        Response::success($this->formatAccount($account));
     }
 
-    // -------------------------------------------------------------------------
-    // POST /accounts         → create
-    // Body: { "site_name", "site_url"?, "username", "password", "notes"? }
-    // -------------------------------------------------------------------------
     public function store(): void
     {
         $userId = Auth::requireAuth();
-        $body   = $this->parseJsonBody();
-
-        $errors = $this->validate($body, ['site_name', 'username', 'password']);
-        if (!empty($errors)) {
-            Response::error(implode(' ', $errors), 422);
-        }
+        $body = $this->parseJsonBody();
+        $data = $this->validatedPayload($body);
+        $vaultKey = Auth::vaultKey();
+        $legacyKey = Auth::legacyVaultKey();
+        $passwordAssessment = PasswordPolicy::evaluateVault(
+            $data['password'],
+            $this->passwordAlreadyUsed($userId, $data['password'], $vaultKey, $legacyKey)
+        );
 
         $newId = $this->accountModel->create(
             $userId,
-            trim($body['site_name']),
-            isset($body['site_url'])  ? trim($body['site_url'])  : null,
-            trim($body['username']),
-            $this->encrypt($body['password']),
-            isset($body['notes'])     ? trim($body['notes'])     : null
+            $data['site_name'],
+            $data['site_url'],
+            $data['username'],
+            Crypto::encryptVault($data['password'], $vaultKey),
+            $data['favorite'],
+            $data['category'],
+            $data['notes']
         );
 
         $account = $this->accountModel->findByIdAndUser($newId, $userId);
-        $account['password'] = $this->decrypt($account['encrypted_password']);
-        unset($account['encrypted_password']);
+        $account['password'] = $data['password'];
+        $account['password_strength'] = $passwordAssessment['strength'];
+        $account['password_warnings'] = $passwordAssessment['warnings'];
 
-        Response::success($account, 201);
+        Response::success($this->formatAccount($account), 201);
     }
 
-    // -------------------------------------------------------------------------
-    // PUT /accounts/{id}     → update
-    // Body: { "site_name", "site_url"?, "username", "password", "notes"? }
-    // -------------------------------------------------------------------------
     public function update(int $id): void
     {
         $userId = Auth::requireAuth();
-        $body   = $this->parseJsonBody();
+        $body = $this->parseJsonBody();
 
-        // Confirm the account exists and belongs to this user before updating
         $existing = $this->accountModel->findByIdAndUser($id, $userId);
         if ($existing === null) {
             Response::error('Account not found.', 404);
         }
 
-        $errors = $this->validate($body, ['site_name', 'username', 'password']);
-        if (!empty($errors)) {
-            Response::error(implode(' ', $errors), 422);
+        $data = $this->validatedPayload($body);
+        $vaultKey = Auth::vaultKey();
+        $legacyKey = Auth::legacyVaultKey();
+        $oldPassword = $this->decryptPasswordOrFail($existing, $vaultKey, $legacyKey);
+        $passwordAssessment = PasswordPolicy::evaluateVault(
+            $data['password'],
+            $this->passwordAlreadyUsed($userId, $data['password'], $vaultKey, $legacyKey, $id)
+        );
+        if (!hash_equals($oldPassword, $data['password'])) {
+            $this->passwordHistoryModel->create($id, $userId, $existing['encrypted_password'], $existing['password_updated_at'] ?? null);
         }
 
         $this->accountModel->update(
             $id,
             $userId,
-            trim($body['site_name']),
-            isset($body['site_url'])  ? trim($body['site_url'])  : null,
-            trim($body['username']),
-            $this->encrypt($body['password']),
-            isset($body['notes'])     ? trim($body['notes'])     : null
+            $data['site_name'],
+            $data['site_url'],
+            $data['username'],
+            Crypto::encryptVault($data['password'], $vaultKey),
+            $data['favorite'],
+            $data['category'],
+            $data['notes']
         );
 
         $account = $this->accountModel->findByIdAndUser($id, $userId);
-        $account['password'] = $this->decrypt($account['encrypted_password']);
-        unset($account['encrypted_password']);
+        $account['password'] = $data['password'];
+        $account['password_strength'] = $passwordAssessment['strength'];
+        $account['password_warnings'] = $passwordAssessment['warnings'];
 
-        Response::success($account);
+        Response::success($this->formatAccount($account));
     }
 
-    // -------------------------------------------------------------------------
-    // DELETE /accounts/{id}  → delete
-    // -------------------------------------------------------------------------
     public function destroy(int $id): void
     {
         $userId = Auth::requireAuth();
 
-        $existing = $this->accountModel->findByIdAndUser($id, $userId);
-        if ($existing === null) {
+        if ($this->accountModel->findByIdAndUser($id, $userId) === null) {
             Response::error('Account not found.', 404);
         }
 
         $this->accountModel->delete($id, $userId);
-
-        Response::success(['message' => 'Account deleted successfully.']);
+        Response::success(['message' => 'Account moved to trash.']);
     }
 
-    // =========================================================================
-    // Private helpers
-    // =========================================================================
-
-    /**
-     * Encrypt a plaintext password using AES-256-CBC.
-     *
-     * The encryption key is derived from the session — specifically a SHA-256
-     * hash of the stored master_password_hash. This means:
-     *   - The key is never stored in the database.
-     *   - The key is only available during an authenticated session.
-     *   - Changing the master password would invalidate all stored entries
-     *     (acceptable at this project scope; a re-encryption step would be
-     *     needed for a production app).
-     *
-     * Output format: base64( iv + ciphertext )
-     */
-    private function encrypt(string $plaintext): string
+    public function restore(int $id): void
     {
-        $key    = $this->derivedKey();
-        $iv     = random_bytes(openssl_cipher_iv_length('aes-256-cbc'));
-        $cipher = openssl_encrypt($plaintext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
-
-        return base64_encode($iv . $cipher);
-    }
-
-    /**
-     * Decrypt a value produced by encrypt().
-     * Returns an empty string if decryption fails (e.g. corrupted data).
-     */
-    private function decrypt(string $encoded): string
-    {
-        $key  = $this->derivedKey();
-        $raw  = base64_decode($encoded);
-        $ivLength = openssl_cipher_iv_length('aes-256-cbc');
-
-        if (strlen($raw) <= $ivLength) {
-            return '';
+        $userId = Auth::requireAuth();
+        $account = $this->accountModel->findAnyByIdAndUser($id, $userId);
+        if ($account === null || empty($account['deleted_at'])) {
+            Response::error('Deleted account not found.', 404);
         }
 
-        $iv         = substr($raw, 0, $ivLength);
-        $ciphertext = substr($raw, $ivLength);
-        $plain      = openssl_decrypt($ciphertext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
-
-        return $plain !== false ? $plain : '';
+        $this->accountModel->restore($id, $userId);
+        $restored = $this->accountModel->findByIdAndUser($id, $userId);
+        Response::success($this->formatAccount($restored));
     }
 
-    /**
-     * Derive a 32-byte encryption key from the current session.
-     * Using the master_password_hash (set during login) as the source
-     * means the key is tied to the user's master password without storing it.
-     */
-    private function derivedKey(): string
+    public function permanentlyDelete(int $id): void
     {
-        $source = $_SESSION['master_password_hash'] ?? session_id();
-        return hash('sha256', $source, true); // raw binary output = 32 bytes
+        $userId = Auth::requireAuth();
+        $account = $this->accountModel->findAnyByIdAndUser($id, $userId);
+        if ($account === null || empty($account['deleted_at'])) {
+            Response::error('Deleted account not found.', 404);
+        }
+
+        $this->accountModel->permanentlyDelete($id, $userId);
+        Response::success(['message' => 'Account permanently deleted.']);
     }
 
-    /**
-     * Decode the JSON request body. Exits with 400 if malformed.
-     */
+    public function markUsed(int $id): void
+    {
+        $userId = Auth::requireAuth();
+
+        if ($this->accountModel->findByIdAndUser($id, $userId) === null) {
+            Response::error('Account not found.', 404);
+        }
+
+        $this->accountModel->markUsed($id, $userId);
+        $account = $this->accountModel->findByIdAndUser($id, $userId);
+        Response::success($this->formatAccount($account));
+    }
+
+    public function password(int $id): void
+    {
+        $userId = Auth::requireAuth();
+        $account = $this->accountModel->findByIdAndUser($id, $userId);
+
+        if ($account === null) {
+            Response::error('Account not found.', 404);
+        }
+
+        Response::success([
+            'password' => $this->decryptPasswordOrFail($account, Auth::vaultKey(), Auth::legacyVaultKey()),
+        ]);
+    }
+
+    public function passwordHistory(int $id): void
+    {
+        $userId = Auth::requireAuth();
+        $account = $this->accountModel->findAnyByIdAndUser($id, $userId);
+        if ($account === null) {
+            Response::error('Account not found.', 404);
+        }
+
+        $vaultKey = Auth::vaultKey();
+        $legacyKey = Auth::legacyVaultKey();
+        $history = array_map(function (array $row) use ($vaultKey, $legacyKey): array {
+            $password = Crypto::decryptVault($row['encrypted_password'], $vaultKey, $legacyKey);
+            if ($password === null) {
+                Response::error('Could not decrypt password history.', 500);
+            }
+
+            return [
+                'id' => (int) $row['id'],
+                'password' => $password,
+                'password_updated_at' => $row['password_updated_at'],
+                'created_at' => $row['created_at'],
+            ];
+        }, $this->passwordHistoryModel->findByAccount($id, $userId));
+
+        Response::success($history);
+    }
+
+    public function passwordReport(): void
+    {
+        $userId = Auth::requireAuth();
+        $vaultKey = Auth::vaultKey();
+        $legacyKey = Auth::legacyVaultKey();
+        $accounts = $this->accountModel->findAllByUser($userId);
+        $passwordMap = [];
+        $weak = [];
+        $reused = [];
+        $old = [];
+        $missingUrl = [];
+        $cutoff = new DateTimeImmutable('-90 days');
+
+        foreach ($accounts as $account) {
+            $password = $this->decryptPasswordOrFail($account, $vaultKey, $legacyKey);
+            $hash = hash('sha256', $password);
+            $passwordMap[$hash][] = (int) $account['id'];
+            $assessment = PasswordPolicy::evaluateVault($password);
+            if ($assessment['strength'] === 'weak' || !empty($assessment['warnings'])) {
+                $weak[] = $this->reportAccount($account);
+            }
+            if (empty($account['site_url'])) {
+                $missingUrl[] = $this->reportAccount($account);
+            }
+            $updated = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', (string) $account['password_updated_at']);
+            if ($updated !== false && $updated < $cutoff) {
+                $old[] = $this->reportAccount($account);
+            }
+        }
+
+        foreach ($passwordMap as $ids) {
+            if (count($ids) > 1) {
+                $reused = array_merge($reused, $ids);
+            }
+        }
+        $reused = array_values(array_unique($reused));
+
+        Response::success([
+            'total' => count($accounts),
+            'weak_count' => count($weak),
+            'reused_count' => count($reused),
+            'old_password_count' => count($old),
+            'missing_url_count' => count($missingUrl),
+            'weak' => $weak,
+            'reused_account_ids' => $reused,
+            'old_passwords' => $old,
+            'missing_urls' => $missingUrl,
+        ]);
+    }
+
     private function parseJsonBody(): array
     {
-        $raw  = file_get_contents('php://input');
+        $raw = file_get_contents('php://input');
         $data = json_decode($raw, true);
 
         if (!is_array($data)) {
@@ -221,18 +279,130 @@ class AccountController
         return $data;
     }
 
-    /**
-     * Validate that required fields are present and non-empty.
-     * Returns an array of error strings (empty = valid).
-     */
-    private function validate(array $body, array $required): array
+    private function validatedPayload(array $body): array
     {
+        $siteName = trim((string) ($body['site_name'] ?? ''));
+        $username = trim((string) ($body['username'] ?? ''));
+        $password = (string) ($body['password'] ?? '');
+        $siteUrl = $this->normalizeSiteUrl($body['site_url'] ?? null);
+        $notes = isset($body['notes']) ? trim((string) $body['notes']) : null;
+        $favorite = filter_var($body['favorite'] ?? false, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        $category = isset($body['category']) ? trim((string) $body['category']) : null;
         $errors = [];
-        foreach ($required as $field) {
-            if (!isset($body[$field]) || trim((string) $body[$field]) === '') {
-                $errors[] = "Field '{$field}' is required.";
+
+        if ($siteName === '') {
+            $errors[] = "Field 'site_name' is required.";
+        }
+        if ($username === '') {
+            $errors[] = "Field 'username' is required.";
+        }
+        if ($password === '') {
+            $errors[] = "Field 'password' is required.";
+        }
+        if (strlen($siteName) > 128) {
+            $errors[] = 'site_name must be 128 characters or less.';
+        }
+        if (strlen($username) > 128) {
+            $errors[] = 'username must be 128 characters or less.';
+        }
+        if ($siteUrl !== null && $siteUrl !== '') {
+            if (strlen($siteUrl) > 512) {
+                $errors[] = 'site_url must be 512 characters or less.';
+            }
+            if (!filter_var($siteUrl, FILTER_VALIDATE_URL)) {
+                $errors[] = 'site_url must be a valid URL.';
             }
         }
-        return $errors;
+        if ($favorite === null) {
+            $errors[] = 'favorite must be a boolean.';
+        }
+        if ($category !== null && $category !== '' && strlen($category) > 64) {
+            $errors[] = 'category must be 64 characters or less.';
+        }
+
+        if (!empty($errors)) {
+            Response::error(implode(' ', $errors), 422);
+        }
+
+        return [
+            'site_name' => $siteName,
+            'site_url' => $siteUrl,
+            'username' => $username,
+            'password' => $password,
+            'favorite' => $favorite ?? false,
+            'category' => $category === '' ? null : $category,
+            'notes' => $notes === '' ? null : $notes,
+        ];
+    }
+
+    private function formatAccount(array $account): array
+    {
+        unset($account['encrypted_password']);
+        $account['favorite'] = (bool) ($account['favorite'] ?? false);
+        return $account;
+    }
+
+    private function normalizeSiteUrl(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $url = trim((string) $value);
+        if ($url === '') {
+            return null;
+        }
+
+        if (!preg_match('#^[a-z][a-z0-9+.-]*://#i', $url)) {
+            $url = 'https://' . $url;
+        }
+
+        return $url;
+    }
+
+    private function optionalBoolean(mixed $value): ?bool
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+    }
+
+    private function reportAccount(array $account): array
+    {
+        return [
+            'id' => (int) $account['id'],
+            'site_name' => $account['site_name'],
+            'username' => $account['username'],
+            'category' => $account['category'],
+            'password_updated_at' => $account['password_updated_at'],
+        ];
+    }
+
+    private function passwordAlreadyUsed(int $userId, string $password, string $vaultKey, ?string $legacyKey, ?int $excludeId = null): bool
+    {
+        foreach ($this->accountModel->findAllByUser($userId, null) as $account) {
+            if ($excludeId !== null && (int) $account['id'] === $excludeId) {
+                continue;
+            }
+
+            $plain = $this->decryptPasswordOrFail($account, $vaultKey, $legacyKey);
+            if (hash_equals($plain, $password)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function decryptPasswordOrFail(array $account, string $vaultKey, ?string $legacyKey): string
+    {
+        $plain = Crypto::decryptVault($account['encrypted_password'], $vaultKey, $legacyKey);
+        if ($plain === null) {
+            Response::error('Could not decrypt vault entry.', 500);
+        }
+
+        return $plain;
     }
 }
